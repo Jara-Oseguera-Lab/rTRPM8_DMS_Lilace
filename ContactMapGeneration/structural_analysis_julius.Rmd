@@ -1,0 +1,492 @@
+---
+title: "structural_analysis_IMPROVED"
+output: html_document
+---
+# libraries
+```{r}
+library(bio3d)
+library(tidyverse)
+library(ggnewscale)
+library(colorspace)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+library(grDevices)
+library(stats)
+```
+
+# import cif files, convert to pdb
+```{r}
+# setup paths
+dir <- "/stor/work/Jara/threedim_bins/structural_analysis"
+output_dir <- file.path(dir, "julius/contactmaps")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(output_dir, "num_contact"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(output_dir, "conserved"), showWarnings = FALSE, recursive = TRUE)
+
+# load structures from PDB IDs
+pdb_ids <- c("9P8Y", "9PB5", "9PAR", "9ZCQ")  # replace with your IDs
+
+pdb_files <- get.pdb(pdb_ids, path = file.path(dir, "julius"), overwrite = FALSE)
+
+julius_mTRPM8_pdb <- lapply(pdb_ids, function(id) {
+  read.pdb(file.path(dir, "julius", paste0(id, ".pdb")))
+})
+names(julius_mTRPM8_pdb) <- pdb_ids
+cat("Loaded", length(julius_mTRPM8_pdb), "TRPM8 structures\n")
+
+# verify residue numbering
+for (name in names(julius_mTRPM8_pdb)) {
+  ca_sel <- atom.select(julius_mTRPM8_pdb[[name]], "calpha")
+  resno_range <- range(julius_mTRPM8_pdb[[name]]$atom$resno[ca_sel$atom])
+  n_residues <- length(unique(julius_mTRPM8_pdb[[name]]$atom$resno[ca_sel$atom]))
+  chains <- unique(julius_mTRPM8_pdb[[name]]$atom$chain)
+  cat(sprintf("  %s: residues %d-%d (total: %d), chains: %s\n", 
+              name, resno_range[1], resno_range[2], n_residues, 
+              paste(chains, collapse=", ")))
+}
+```
+
+# contact calculations
+```{r}
+# contact calculation of ChimeraX from scratch
+chimerax_vdw_radii <- list(
+  C = 1.70, N = 1.55, O = 1.52, S = 1.80, 
+  H = 1.20, P = 1.80, F = 1.47, Cl = 1.75,
+  Br = 1.85, I = 1.98, Se = 1.90
+)
+
+calc_contacts_chimerax_fast <- function(pdb_obj,
+                                        overlap_cutoff = -0.4,
+                                        allowance = 0.0,
+                                        selection = "sidechain",
+                                        resno_range = NULL,
+                                        exclude_adjacent = TRUE,
+                                        distance_prefilter = 10.0) {
+
+  # select only sidechain atoms within range (all if no range)
+  if (!is.null(resno_range)) {
+    atom_sel <- atom.select(pdb_obj, selection, resno = resno_range)
+  } else {
+    atom_sel <- atom.select(pdb_obj, selection)
+  }
+
+  # extract atom coordinate matrix, element type, residue number, residue identity, and chain
+  xyz     <- pdb_obj$xyz[atom_sel$xyz]
+  xyz_mat <- matrix(xyz, ncol = 3, byrow = TRUE)
+  elety   <- pdb_obj$atom$elety[atom_sel$atom]
+  resno   <- pdb_obj$atom$resno[atom_sel$atom]
+  resid   <- pdb_obj$atom$resid[atom_sel$atom]
+  chain   <- pdb_obj$atom$chain[atom_sel$atom]
+
+  # assign VDW radius to each atom by element symbol
+  atom_vdw <- sapply(substr(elety, 1, 1), function(e) {
+    ifelse(e %in% names(chimerax_vdw_radii), chimerax_vdw_radii[[e]], 1.70)
+  })
+
+  # pairwise euclidean distance between all atoms
+  distance_mat <- as.matrix(dist(xyz_mat, method = "euclidean"))
+
+  # VDW overlap: positive = clash, negative = near-contact
+  vdw_sum_mat <- outer(atom_vdw, atom_vdw, "+")
+  overlap_mat <- vdw_sum_mat - distance_mat - allowance
+
+  # contact if overlap >= cutoff AND within prefilter distance
+  contact_mat      <- (overlap_mat >= overlap_cutoff) & (distance_mat < distance_prefilter) & (overlap_mat <= 0.6)
+  diag(contact_mat) <- FALSE
+
+  # unique residue metadata
+  unique_resno   <- unique(resno)
+  unique_resid   <- resid[match(unique_resno, resno)]
+  unique_chains  <- chain[match(unique_resno, resno)]
+  n_res          <- length(unique_resno)
+  resno_to_idx   <- match(resno, unique_resno)
+
+  # initialize residue-level matrices
+  residue_contact_count <- matrix(0,   nrow = n_res, ncol = n_res)
+  residue_min_distance <- matrix(Inf, nrow = n_res, ncol = n_res)
+  interaction_details <- list()
+
+  for (i in 1:n_res) {
+    res_i_atoms <- which(resno_to_idx == i)
+    if (length(res_i_atoms) == 0) next
+
+    for (j in i:n_res) {
+      res_j_atoms <- which(resno_to_idx == j)
+      if (length(res_j_atoms) == 0) next
+
+      # skip sequence-adjacent residues
+      if (exclude_adjacent && abs(unique_resno[i] - unique_resno[j]) <= 1) next
+
+      contact_subset <- contact_mat[res_i_atoms, res_j_atoms, drop = FALSE]
+      dist_subset    <- distance_mat[res_i_atoms, res_j_atoms, drop = FALSE]
+      n_contacts     <- sum(contact_subset)
+
+      if (n_contacts > 0) {
+        residue_contact_count[i, j] <- n_contacts
+        residue_contact_count[j, i] <- n_contacts
+
+        min_dist <- min(dist_subset)
+        residue_min_distance[i, j] <- min_dist
+        residue_min_distance[j, i] <- min_dist
+
+        interaction_details[[length(interaction_details) + 1]] <- data.frame(
+          res1_num         = unique_resno[i],
+          res1_id          = unique_resid[i],
+          res2_num         = unique_resno[j],
+          res2_id          = unique_resid[j],
+          n_atomic_contacts = n_contacts,
+          min_distance     = min_dist,
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+
+  # binary contact map
+  residue_contact_binary <- residue_contact_count > 0
+  diag(residue_contact_binary) <- FALSE
+
+  # label rows/cols with chain:residueNUM
+  res_labels <- paste0(unique_chains, ":", unique_resid, unique_resno)
+  rownames(residue_contact_count)  <- colnames(residue_contact_count)  <- res_labels
+  rownames(residue_contact_binary) <- colnames(residue_contact_binary) <- res_labels
+  rownames(residue_min_distance)   <- colnames(residue_min_distance)   <- res_labels
+
+  interaction_df <- if (length(interaction_details) > 0) do.call(rbind, interaction_details) else data.frame()
+
+  return(list(
+    contact_binary    = residue_contact_binary,
+    contact_count     = residue_contact_count,
+    min_distance      = residue_min_distance,
+    residues          = unique_resno,
+    residue_ids       = unique_resid,
+    chains            = unique_chains,
+    interaction_details = interaction_df,
+    parameters        = list(
+      overlap_cutoff = overlap_cutoff,
+      allowance      = allowance,
+      selection      = selection,
+      method         = "ChimeraX-like VDW overlap"
+    )
+  ))
+}
+
+julius_contacts_region <- lapply(names(julius_mTRPM8_pdb), function(name) {
+  cat("Processing", name, "...\n")
+  calc_contacts_chimerax_fast(julius_mTRPM8_pdb[[name]],
+                               overlap_cutoff = -0.4,
+                               selection = "sidechain",
+                               resno_range = 807:1050)
+})
+names(julius_contacts_region) <- names(julius_mTRPM8_pdb)
+```
+
+# my cm overlaid
+```{r}
+# Extract interaction details from calculated contacts and format like chimerax data
+calc_combined_df <- bind_rows(
+  lapply(names(julius_contacts_region), function(i) {
+    julius_contacts_region[[i]]$interaction_details %>%
+      mutate(
+        structure = i,
+        # mirror contacts
+        resnum1 = res1_num,
+        resnum2 = res2_num
+      ) %>%
+      bind_rows(
+        mutate(., resnum1 = res2_num, resnum2 = res1_num)
+      )
+  })
+)
+
+calc_combined_df <- calc_combined_df %>%
+  filter(
+    resnum1 >= 807, resnum1 <= 1050,
+    resnum2 >= 807, resnum2 <= 1050
+  ) %>%
+  group_by(resnum1, resnum2) %>%
+  mutate(structures_present = paste(sort(unique(structure)), collapse = " & "),
+         contact_method = paste("CalcContact")) %>%
+  ungroup() %>%
+  mutate(structures_present = case_when(structures_present == "Closed & Open" ~ "C1 & O",
+                   structures_present == "Open" ~ "Open (O)",
+                   structures_present == "Closed" ~ "Closed (C1)",
+                   structures_present == "Desensitized" ~ "Desensitized (D)",
+                   structures_present == "Desensitized & Open" ~ "D & O",
+                   structures_present == "Closed & Desensitized" ~ "C1 & D",
+                   structures_present == "Closed & Desensitized & Open" ~ "C1 & D & O")) %>% 
+  arrange(structures_present == "C1 & D & O")
+
+filter(calc_combined_df, structure == "9ZCQ") %>% 
+  ggplot(aes(x = resnum1, y = resnum2, color = structure)) +
+  geom_point(size = 2, shape = 15) +
+  scale_color_manual(
+    values = c(
+      "9PB5"                         = "steelblue",
+      "9PB5"                       = "lightgreen",
+      "9ZCQ"                 = "#dd1d77",
+      "9PAR"                = "#31a354"
+    ),
+    breaks = c("Open", "Closed", "Desensitized",
+               "Closed & Open", "Desensitized & Open",
+               "Closed & Desensitized",
+               "Closed & Desensitized & Open"),
+    name = "Conformation") +
+  coord_fixed(ratio = 0.2, xlim = c(940, 965), ylim = c(810, 1050)) +
+  scale_x_continuous(breaks = seq(940, 965, by = 5)) +
+  scale_y_continuous(breaks = seq(810, 1050, by = 10)) +
+  labs(x = "Residue", y = "Residue", title = "Contact Maps (Calculated Contacts)") +
+  theme_classic() +
+  theme(
+    axis.text = element_text(size = 8),
+    axis.title = element_text(size = 10),
+    plot.title = element_text(hjust = 0.5, size = 12),
+    legend.position = "right"
+  )
+```
+
+# compare contact methods
+```{r}
+# import scores
+cold_scores_df <- read.csv("/stor/work/Jara/threedim_bins/lilace/finalout/li_obj/combined_score/cold/combined_scores.csv")
+menthol_scores_df <- read.csv("/stor/work/Jara/threedim_bins/lilace/finalout/li_obj/combined_score/menthol/combined_scores.csv")
+rt_scores_df <- read.csv("/stor/work/Jara/threedim_bins/lilace/finalout/li_obj/combined_score/rt/combined_scores.csv")
+
+combined_scores_df <- bind_rows(cold_scores_df, menthol_scores_df)
+
+cold_scores_line_df <- cold_scores_df %>% 
+  filter(position != 0) %>% 
+  select(position, effect, effect_se) %>% 
+  group_by(position) %>% 
+  mutate(effect_sd = sd(effect),
+         effect_se = effect_sd/sqrt(n())) %>% 
+  summarise(effect = median(effect),
+    effect_sd_median = median(effect_sd),
+    effect_se_median = median(effect_se)
+  ) %>% 
+  rename(effect_median = effect) %>% 
+  mutate(Condition = paste("Cold"))
+
+menthol_scores_line_df <- menthol_scores_df %>% 
+  filter(position != 0) %>% 
+  select(position, effect, effect_se) %>% 
+  group_by(position) %>% 
+  mutate(effect_sd = sd(effect),
+         effect_se = effect_sd/sqrt(n())) %>% 
+  summarise(effect = median(effect),
+    effect_sd_median = median(effect_sd),
+    effect_se_median = median(effect_se)
+  ) %>% 
+  rename(effect_median = effect) %>%  
+  mutate(Condition = paste("Menthol"))
+
+scores_line_df <- bind_rows(cold_scores_line_df, menthol_scores_line_df) %>% 
+  mutate(position_9PAR = position - 6,
+         position_9PB5 = position,
+         position_9P8Y = position,
+         position_9ZCQ = position - 10)
+
+scores_line <- ggplot(scores_line_df, aes(x = position, y = effect_median, 
+                            color = Condition, fill = Condition)) +
+  geom_ribbon(aes(ymin = effect_median - effect_se,
+                  ymax = effect_median + effect_se),
+              alpha = 0.2, color = NA) +
+  geom_line() +
+  scale_color_manual(values = c("Cold" = "blue", "Menthol" = "green")) +
+  scale_fill_manual(values = c("Cold" = "blue", "Menthol" = "green")) +
+  theme_classic() +
+  labs(x = "Position", y = "Scores") +
+  coord_fixed(ratio = 10, xlim = c(940, 965), ylim = c(-2, 0)) +
+  scale_x_continuous(breaks = seq(940, 965, by = 5)) +
+  scale_y_continuous(breaks = seq(-2, 0, by = 0.5), position = "right")
+```
+
+# combined cm
+```{r}
+cm_fillcolors <- c(
+      "9P8Y"                         = "#e9a3c9",
+      "9PB5"                       = "#92cf60",
+      "9ZCQ"                 = "#dd1d77",
+      "9PAR"                = "#31a354"
+    )
+cm_strokecolors <- darken(cm_fillcolors, amount = 0.2)
+calc_combined_df$structure <- factor(calc_combined_df$structure, levels = names(cm_fillcolors))
+cm_fillcolors <- cm_fillcolors[levels(calc_combined_df$structure)]
+cm_strokecolors <- cm_strokecolors[levels(calc_combined_df$structure)]
+
+gray <- c(951, 952, 953, 954)
+purple <- c(955, 958, 959, 961)
+lavender <- c(956, 957, 960, 962)
+red <- c(963, 964)
+orange <- c(965, 966, 967)
+blue <- c(968, 969, 970, 971, 972, 973, 974)
+
+calc_combined_df <- calc_combined_df %>%
+  mutate(
+    resnum1_adj = case_when(
+      structure %in% c("9PB5", "9P8Y") ~ resnum1,
+      structure == "9PAR"              ~ resnum1 + 6,
+      structure == "9ZCQ"              ~ resnum1 + 10,
+      .default = resnum1
+    ),
+    section = case_when(
+      resnum1_adj %in% gray     ~ "#999999",
+      resnum1_adj %in% purple   ~ "#a305c2",
+      resnum1_adj %in% lavender ~ "#c9ace6",
+      resnum1_adj %in% red      ~ "#ff0066",
+      resnum1_adj %in% orange   ~ "#ff5400",
+      resnum1_adj %in% blue     ~ "#000098",
+      .default = NA_character_
+    ),
+    section_stroke = darken(section, amount = 0.2)
+  ) %>%
+  select(-resnum1_adj)
+
+jcp <- list(
+  "9PAR" = list(x_min = 945, x_max = 968, y_min = 814, y_max = 924),
+  "9PB5" = list(x_min = 951, x_max = 974, y_min = 820, y_max = 930),
+  "9P8Y" = list(x_min = 951, x_max = 974, y_min = 820, y_max = 930),
+  "9ZCQ" = list(x_min = 941, x_max = 964, y_min = 810, y_max = 920)
+)
+
+e_min <- -2
+e_max <- -0.5
+
+for (i in pdb_ids) {
+y_max_i <- jcp[[i]][["y_max"]]   # per-structure y_max
+y_min_i <- jcp[[i]][["y_min"]]
+  
+  rescale_effect_i  <- function(x) (x - e_min) / (e_max - e_min) * (y_max_i - y_min_i) + y_min_i
+  rescale_inverse_i <- function(x) (x - y_min_i) / (y_max_i - y_min_i) * (e_max - e_min) + e_min
+  
+p <- filter(calc_combined_df, structure == i) %>% 
+  ggplot(aes(x = resnum1, y = resnum2)) +
+  geom_ribbon(data = scores_line_df,
+              aes(x = .data[[paste0("position_", i)]],
+                  y = rescale_effect_i(effect_median),
+                  ymin = rescale_effect_i(pmax(effect_median - effect_se_median, e_min)),
+                  ymax = rescale_effect_i(pmin(effect_median + effect_se_median, e_max)),
+                  fill = Condition),
+              alpha = 0.2, color = NA, inherit.aes = FALSE) +
+  geom_line(data = scores_line_df,
+            aes(x = .data[[paste0("position_", i)]], y = rescale_effect_i(effect_median), color = Condition),
+            inherit.aes = FALSE, alpha = 0.5) +
+  scale_color_manual(values = c("Cold" = "#0032cc", "Menthol" = "#006600"),
+                     name = "Condition Score") +
+  scale_fill_manual(values = c("Cold" = "#0032cc", "Menthol" = "#006600"),
+                    name = "Condition Score") +
+  scale_x_continuous(name = "", breaks = seq(jcp[[i]][["x_min"]], jcp[[i]][["x_max"]], by = 5), limits = c(jcp[[i]][["x_min"]], jcp[[i]][["x_max"]])) +
+  scale_y_continuous(
+    name = "Sequence position",
+    limits = c(y_min_i, jcp[[i]][["y_max"]]),
+    breaks = seq(y_min_i, jcp[[i]][["y_max"]], by = 20),
+    sec.axis = sec_axis(~ rescale_inverse_i(.),
+                        name = "Scores",
+                        breaks = seq(e_min, e_max, by = 0.5))
+  ) +
+  coord_fixed(ratio = 0.2) +
+  theme_classic(base_family = "sans") +
+  theme(
+    axis.text = element_text(size = 8),
+    axis.title = element_text(size = 8),
+    plot.title = element_text(hjust = 0.5, size = 8),
+    legend.position = "right",
+    axis.title.y.right = element_text(angle = 90),
+    legend.text = element_text(size = 8),
+    legend.title = element_text(size = 8),
+    legend.key.size = unit(0.4, "cm"),
+    legend.spacing.y = unit(0.1, "cm")
+  ) +
+  guides(
+    color = guide_legend(order = 1),
+    fill  = guide_legend(order = 2)
+  )+
+  new_scale_color() +
+  new_scale_fill() +
+  geom_point(aes(fill = section, color = section_stroke),
+           size = 2.5, stroke = 0.8, shape = 22) +
+  scale_fill_identity() +
+  scale_color_identity()+
+  labs(title = i)
+
+ggsave(paste0("/stor/work/Jara/threedim_bins/structural_analysis/julius/",i,"_cm.pdf"), plot = p, width=17.8, height=22.5, units="cm", dpi=320, device = cairo_pdf)
+}
+```
+
+# count per position histogram
+```{r}
+calccontactsOnly_countmatrix_list <- list()
+
+for (i in names(julius_contacts_region)) {
+calccontactsOnly_countmatrix <- as.data.frame(julius_contacts_region[[i]][["interaction_details"]]) %>% 
+  rownames_to_column(var="temp") %>% select(-temp) %>% 
+  rename(resnum1 = res1_num, resnum2 = res2_num, resname1 = res1_id, resname2 = res2_id, contacts = n_atomic_contacts) %>% 
+  select(resnum1, resnum2, contacts) %>% 
+  complete(resnum1 = 807:1050, resnum2 = 807:1050, fill = list(contacts = 0)) %>% 
+  mutate(resnum1 = as.numeric(resnum1), resnum2 = as.numeric(resnum2), contacts = as.numeric(contacts)) %>% 
+  filter(between(resnum1, 807, 1050) & between(resnum2, 807, 1050)) %>% 
+  pivot_wider(names_from = resnum2, values_from = contacts, values_fill = 0) %>% 
+  column_to_rownames(var="resnum1") %>% 
+  summarise(across(everything(), sum)) %>% 
+  pivot_longer(everything(), names_to = "position", values_to = "contacts") %>% 
+  mutate(position = as.numeric(position),
+         contacts = as.numeric(contacts),
+         conformation = paste(i))
+calccontactsOnly_countmatrix_list[[i]] <- calccontactsOnly_countmatrix
+}
+
+calccontactsOnly_countmatrix_combined <- bind_rows(calccontactsOnly_countmatrix_list)
+
+test <- calccontactsOnly_countmatrix_combined %>% 
+  pivot_wider(names_from = conformation, values_from = contacts) %>% 
+  filter(between(as.numeric(position), 940, 975)) %>% 
+  column_to_rownames(var="position") %>%
+  t()
+
+group_colors_hm <- c(
+      "9P8Y"                         = "#e9a3c9",
+      "9PB5"                       = "#92cf60",
+      "9ZCQ"                 = "#dd1d77",
+      "9PAR"                = "#31a354"
+    )
+
+ht_list <- NULL
+for (i in rownames(test)) {
+  row_mat <- matrix(test[i, ], nrow = 1)
+  rownames(row_mat) <- i
+  
+  ht_list <- ht_list %v%
+    Heatmap(
+      row_mat,
+      name = i,
+      cluster_rows = FALSE,
+      cluster_columns = FALSE,
+      col = colorRamp2(
+        seq(0, 156, length.out = 160),
+        colorRampPalette(c("white", group_colors_hm[i]))(160)
+      ),
+      column_title = NULL,
+      show_column_names = TRUE,
+      row_names_side = "left",
+      width = unit(ncol(row_mat) * 5, "mm"),
+      height = unit(10, "mm"),
+      row_names_gp = gpar(fontsize = 8, fontfamily = "Arial"),
+      column_names_gp = gpar(fontsize = 8, fontfamily = "Arial"),
+      heatmap_legend_param = list(
+        at = c(0, 40, 80, 120, 160),       # legend tick marks
+        labels_gp = gpar(fontsize = 8, fontfamily = "Arial"),
+        title_gp = gpar(fontsize = 8, fontfamily = "Arial")
+      )
+    )
+}
+
+cairo_pdf("/stor/work/Jara/threedim_bins/structural_analysis/julius/contact_heatmap.pdf",
+          width = 17.8, height = 5/2.54)
+draw(ht_list,
+     heatmap_legend_side = "right",
+     annotation_legend_side = "right",
+     legend_labels_gp = gpar(fontsize = 8, fontfamily = "Arial"),
+     legend_title_gp = gpar(fontsize = 8, fontfamily = "Arial"))
+dev.off()
+```

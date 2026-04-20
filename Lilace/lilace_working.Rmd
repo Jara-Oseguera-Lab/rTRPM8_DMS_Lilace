@@ -1,0 +1,480 @@
+---
+title: "lilace_working"
+output: html_document
+date: "2025-10-23"
+---
+
+# import libraries
+```{r}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(BiocManager)
+library(plotly)
+library(tibble)
+library(dbscan)
+library(pheatmap)
+library(ComplexHeatmap)
+library(ggpubr)
+library(cmdstanr)
+library(lilace)
+```
+
+# import lilace inputs
+```{r}
+# Data Naming Convention:
+# NEWRep3 = Replicate 1; Rep4 = Replicate 2
+
+li <- bind_rows(read.csv("/stor/work/Jara/data/2025/lilace_inputs/NEWRep3.csv") %>% 
+  select(-X), read.csv("/stor/work/Jara/data/2025/lilace_inputs/Rep4.csv") %>% 
+  select(-X)) %>% 
+  mutate(Mutation_Type = "missense",
+         Replicate = paste0(Replicate,"_",Condition))
+li <- bind_rows(li, read.csv("/stor/work/Jara/data/2025/lilace_inputs/sm_Rep3.csv"), read.csv("/stor/work/Jara/data/2025/lilace_inputs/sm_Rep4.csv")) %>% select(-X) %>%
+  filter(substr(Variant, 1,1) != substr(Variant, 5, 5))
+
+li_menthol <- filter(li, Condition == "Menthol")
+li_cold <- filter(li, Condition == "Cold")
+
+set.seed(123)
+```
+
+# load input data
+```{r}
+condition_list <- c("cold", "menthol")
+li_list <- c("li")
+li_obj <- list()
+for (i in li_list) {
+  for (z in tolower(condition_list)) {
+    testsource <- get(paste0(i, "_", z))
+    obj_list <- get(paste0(i, "_obj"))
+    test <- lilace_from_counts(variant_id = testsource$Variant, mutation_type = testsource$Mutation_Type, position = testsource$Position, replicate = testsource$Replicate, counts = testsource[,6:8], metadata = testsource %>%
+                                     select(WT_AA, mutation = Mutation_AA, Condition))
+    obj_list[[z]] <- test
+    assign(paste0(i, "_obj"), obj_list)
+  }
+}
+```
+
+# normalize for sorting proportions
+```{r}
+bp <- list(NEWRep3_Menthol = c(0.3571429, 0.3970588, 0.2457983),
+           NEWRep3_Cold = c(0.01198939, 0.6477886, 0.340222),
+           Rep4_Menthol = c(0.18537074, 0.5621242, 0.25250501),
+           Rep4_Cold = c(0.08559977, 0.5751503, 0.33924991))
+
+for (i in names(li_obj)) {
+  reps_in_data <- unique(li_obj[[i]]$data$rep)
+  bp_subset <- bp[names(bp) %in% reps_in_data]
+  for (z in reps_in_data) {
+   li_obj[[i]] <- lilace_sorting_normalize(li_obj[[i]], bp_subset, rep_specific = T) 
+  }
+}
+```
+
+# run lilace
+```{r}
+condition_list <- c("menthol", "cold")
+obj_list <- c("li_obj")
+
+# Initialize lists to store results
+lilace_results <- list()
+lilace_scores <- list()
+
+for (obj_name in obj_list) {
+  # Initialize sublists for this object type
+  lilace_results[[obj_name]] <- list()
+  lilace_scores[[obj_name]] <- list()
+  
+  # Get the actual object
+  obj <- get(obj_name)
+  
+  for (i in condition_list) {
+    output_dir <- paste0("/stor/work/Jara/threedim_bins/lilace/finalout/", 
+                         obj_name, "/lo_", i)
+    
+    # Create output directory if it doesn't exist
+    if (!dir.exists(output_dir)) {
+      dir.create(output_dir, recursive = TRUE)
+    }
+    
+    temp <- obj[[i]]
+    
+    cat("Processing", obj_name, "-", i, "\n")
+    
+    # Store results in nested lists
+    lilace_results[[obj_name]][[i]] <- lilace_fit_model(
+      temp, output_dir, 
+      control_correction = TRUE, 
+      use_positions = FALSE, 
+      pseudocount = TRUE, 
+      n_parallel_chains = 4
+    )
+    
+    lilace_scores[[obj_name]][[i]] <- read_tsv(
+      paste0(output_dir, "/lilace_output/variant_scores.tsv"), 
+      show_col_types = FALSE
+    )
+  }
+}
+
+# Save combined scores
+for (obj_name in obj_list) {
+  for (i in condition_list) {
+    output_dir <- paste0("/stor/work/Jara/threedim_bins/lilace/finalout/",
+                         obj_name, "/combined_score/", i)
+    if (!dir.exists(output_dir)) {
+      dir.create(output_dir, recursive = TRUE)
+    }
+    score_path <- file.path(output_dir, "combined_scores.csv")
+    write.csv(x = lilace_scores[[obj_name]][[i]], file = score_path, row.names = FALSE)
+  }
+}
+```
+
+# plot results
+```{r}
+condition_list <- c("Menthol","Cold")
+rep_list <- c("NEWRep3", "Rep4")
+
+# Combined replicate heatmaps (all reps together)
+for (i in condition_list) {
+  output_dir <- paste0("/stor/work/Jara/threedim_bins/lilace/finalout/lo_", tolower(i))
+  temp <- lilace_scores[["li_obj"]][[tolower(i)]]
+  
+  # Check if scores exist
+  if (is.null(temp) || nrow(temp) == 0) {
+    warning(paste("No scores found for condition", i))
+    next
+  }
+  
+  coldtest <- temp %>% 
+    filter(!str_detect(variant, "SM")) %>% 
+    select(mutation, position, effect_se) %>% 
+    mutate(mutation = factor(mutation, levels = c("I", "L", "F", "V", "C", "M", "A", "W", "T", "Y",
+              "G", "S", "N", "H", "P", "Q", "R", "E", "K", "D"))) %>% 
+    mutate(position = factor(position, levels = as.character(927:974))) %>% 
+    pivot_wider(names_from = position, values_from = effect_se) %>% 
+    arrange(mutation) %>% 
+    mutate(across(-mutation, as.numeric)) %>% 
+    column_to_rownames(var="mutation") %>% 
+    as.matrix()
+
+  # Color palette: blue for positive, red for negative, white at zero
+  all_vals <- as.numeric(coldtest)
+  minv <- min(all_vals, na.rm = TRUE)
+  maxv <- max(all_vals, na.rm = TRUE)
+  
+  # Always ensure white at 0, red at min, blue at max
+  breaks <- seq(minv, maxv, length.out = 102)
+  zero_index <- which.min(abs(breaks))
+  cols_low <- colorRampPalette(c("red", "white"))(zero_index)
+  cols_high <- colorRampPalette(c("white", "blue"))(102 - zero_index)
+  my_colors <- c(cols_low, cols_high[-1])
+
+  p <- pheatmap::pheatmap(
+    coldtest,
+    na_col = "black",
+    color = my_colors,
+    breaks = breaks,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    cellwidth = 9,
+    cellheight = 9,
+    main = paste0("Heatmap for All Amino Acids at Every Position (",i,")")
+  )
+  print(p)
+  
+  plot_dir <- "/stor/work/Jara/threedim_bins/lilace/finalplots"
+  if (!dir.exists(plot_dir)) dir.create(plot_dir, recursive = TRUE)
+  
+  ggsave(file.path(plot_dir, paste0("combrep_", i, "_hm.pdf")), plot=p, width = 10, height = 8)
+  
+  coldtest <- as.data.frame(coldtest) %>% 
+    rownames_to_column(var="Substituting Residue")
+  write.csv(as.data.frame(coldtest), file = paste0("/stor/work/Jara/threedim_bins/lilace/finalout/combinedFINAL/",i,"_combinedscore-standarderror.csv"))
+}
+```
+
+
+# process rep as individual
+```{r}
+# Prepare lists to store objects and scores
+lilace_indrep_results <- list()
+lilace_indrep_scores <- list()
+
+rep_list <- c("NEWRep3", "Rep4")
+condition_list <- c("menthol", "cold")
+li_obj_rep <- list()
+
+for (i in rep_list) {
+  li_obj_rep[[i]] <- list()
+  for (z in condition_list) {
+    li_obj_rep[[i]][[z]] <- list()
+    li_obj_rep[[i]][[z]] <- li_obj[[z]]
+    li_obj_rep[[i]][[z]][["normalized_data"]] <- li_obj[[z]][["normalized_data"]] %>% 
+      filter(str_detect(rep, i))
+    li_obj_rep[[i]][[z]][["data"]] <- li_obj[[z]][["data"]] %>% 
+      filter(str_detect(rep, i))
+  }
+
+  
+  # Fit models and save results / scores
+  lilace_indrep_results[[i]] <- list()
+  lilace_indrep_scores[[i]] <- list()
+}
+
+for (i in rep_list) {
+  for (z in condition_list) {
+    bp_rep <- bp[grep(i, names(bp))]
+    bp_subset <- bp_rep[grep(z, names(bp_rep), ignore.case = TRUE)]
+    li_obj_rep[[i]][[z]] <- lilace_sorting_normalize(li_obj_rep[[i]][[z]], bp_subset, rep_specific = T)
+    output_dir <- paste0("/stor/work/Jara/threedim_bins/lilace/finalout/indrep/lo_", i, "_", z)
+    if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+    
+    # Fit model
+    lilace_indrep_results[[i]][[z]] <- lilace_fit_model(
+      li_obj_rep[[i]][[z]], 
+      output_dir,
+      control_correction = TRUE,
+      use_positions = FALSE,
+      pseudocount = TRUE,
+      n_parallel_chains = 4
+    )
+    
+    # Read variant_scores.tsv
+    score_path <- file.path(output_dir, "lilace_output", "variant_scores.tsv")
+    if (file.exists(score_path)) {
+      lilace_indrep_scores[[i]][[z]] <- read_tsv(score_path, show_col_types = FALSE)
+    } else {
+      warning(paste("variant_scores.tsv not found for replicate", i, "condition", z))
+    }
+  }
+  
+  # Generate heatmaps for each condition
+  for (z in condition_list) {
+    temp <- lilace_indrep_scores[[i]][[z]]
+    if (is.null(temp)) next
+    
+    coldtest <- temp %>% 
+      filter(!str_detect(variant, "SM")) %>% 
+      select(mutation, position, effect) %>% 
+      mutate(mutation = factor(mutation, levels = c("I","L","F","V","C","M","A","W","T","Y",
+                                                    "G","S","N","H","P","Q","R","E","K","D"))) %>% 
+      mutate(position = factor(position, levels = as.character(927:974))) %>% 
+      pivot_wider(names_from = position, values_from = effect) %>% 
+      arrange(mutation) %>% 
+      mutate(across(-mutation, as.numeric)) %>% 
+      column_to_rownames(var = "mutation") %>% 
+      as.matrix()
+    a <- lilace_score_density(temp, output_dir, score.col="effect", 
+                     name=paste0("l_",i,"score_histogram"), hist=T, scale.free=T)
+    
+    # Color palette
+    all_vals <- as.numeric(coldtest)
+    minv <- min(all_vals, na.rm = TRUE)
+    maxv <- max(all_vals, na.rm = TRUE)
+    breaks <- seq(minv, maxv, length.out = 102)
+    zero_index <- which.min(abs(breaks))
+    cols_low <- colorRampPalette(c("red","white"))(zero_index)
+    cols_high <- colorRampPalette(c("white","blue"))(102-zero_index)
+    my_colors <- c(cols_low, cols_high[-1])
+    
+    p <- pheatmap(
+      coldtest,
+      na_col = "black",
+      color = my_colors,
+      breaks = breaks,
+      cluster_rows = FALSE,
+      cluster_cols = FALSE,
+      cellwidth = 9,
+      cellheight = 9,
+      main = paste0("Heatmap for All Amino Acids at Every Position using Lilace (", i, " - ", z, ")")
+    )
+    print(p)
+  }
+}
+
+condition_list <- c("menthol", "cold")
+for (i in rep_list) {
+  output_dir <- paste0("/stor/work/Jara/threedim_bins/lilace/finalout/indrep/", i)
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+  for (z in condition_list) {
+  score_path <- file.path(output_dir, paste0(z, "_scores.csv"))
+  write.csv(x = lilace_indrep_scores[[i]][[z]], file = score_path, row.names = FALSE)
+}
+}
+```
+
+# visualize indrep
+```{r}
+condition_list <- c("menthol", "cold")
+rep_list <- c("NEWRep3", "Rep4")
+
+# Generate heatmaps for all replicates
+for (i in rep_list) {
+  for (z in condition_list) {
+    output_dir <- paste0("/stor/work/Jara/threedim_bins/lilace/finalout/indrep/lo_", i, "_", tolower(z))
+    score_path <- file.path(output_dir, "lilace_output", "variant_scores.tsv")
+    
+    if (file.exists(score_path)) {
+      lilace_indrep_scores[[i]][[z]] <- read_tsv(score_path, show_col_types = FALSE)
+    } else {
+      warning(paste("variant_scores.tsv not found for replicate", i, "condition", z))
+    }
+    
+    temp <- lilace_indrep_scores[[i]][[z]]
+    if (is.null(temp) || nrow(temp) == 0) next
+    
+    coldtest <- temp %>% 
+      filter(!str_detect(variant, "SM")) %>% 
+      select(mutation, position, effect_se) %>% 
+      mutate(mutation = factor(mutation, levels = c("I","L","F","V","C","M","A","W","T","Y",
+                                                    "G","S","N","H","P","Q","R","E","K","D"))) %>% 
+      mutate(position = factor(position, levels = as.character(927:974))) %>% 
+      pivot_wider(names_from = position, values_from = effect_se) %>% 
+      arrange(mutation) %>% 
+      mutate(across(-mutation, as.numeric)) %>% 
+      column_to_rownames(var = "mutation") %>% 
+      as.matrix()
+    
+    # Color palette
+    all_vals <- as.numeric(coldtest)
+    minv <- min(all_vals, na.rm = TRUE)
+    maxv <- max(all_vals, na.rm = TRUE)
+    breaks <- seq(minv, maxv, length.out = 102)
+    zero_index <- which.min(abs(breaks))
+    cols_low <- colorRampPalette(c("red","white"))(zero_index)
+    cols_high <- colorRampPalette(c("white","blue"))(102-zero_index)
+    my_colors <- c(cols_low, cols_high[-1])
+    
+    p <- pheatmap::pheatmap(
+      coldtest,
+      na_col = "black",
+      color = my_colors,
+      breaks = breaks,
+      cluster_rows = FALSE,
+      cluster_cols = FALSE,
+      cellwidth = 9,
+      cellheight = 9,
+      main = paste0("Heatmap for All Amino Acids at Every Position using Lilace (", i, " - ", z, ")"))
+    print(p)
+    
+    plot_dir <- "/stor/work/Jara/threedim_bins/lilace/finalplots"
+    if (!dir.exists(plot_dir)) dir.create(plot_dir, recursive = TRUE)
+    ggsave(file.path(plot_dir, paste0(i,"_",z,"_indrep_hm.pdf")), plot=p, width = 10)
+    
+    coldtest <- as.data.frame(coldtest) %>% 
+    rownames_to_column(var="Substituting Residue")
+  write.csv(coldtest, file = paste0("/stor/work/Jara/threedim_bins/lilace/finalout/indrepFINAL/",i,"_",z,"_indrepse.csv"))
+  }
+}
+
+# Pairwise replicate correlations
+repscorecor_list <- list()
+cor_result_list <- list()
+
+# Define replicate pairs to compare
+rep_pairs <- list(
+  c("NEWRep3", "Rep4")
+)
+
+for (z in condition_list) {
+  # Initialize storage for this condition
+  repscorecor_list[[z]] <- list()
+  cor_result_list[[z]] <- list()
+  
+  for (pair in rep_pairs) {
+    rep1 <- pair[1]
+    rep2 <- pair[2]
+    pair_name <- paste0(rep1, "_vs_", rep2)
+    
+    path1 <- file.path("/stor/work/Jara/threedim_bins/lilace/finalout/indrep",
+                       paste0("lo_", rep1, "_", z),
+                       "lilace_output/variant_scores.tsv")
+    path2 <- file.path("/stor/work/Jara/threedim_bins/lilace/finalout/indrep",
+                       paste0("lo_", rep2, "_", z),
+                       "lilace_output/variant_scores.tsv")
+    
+    if (!file.exists(path1) || !file.exists(path2)) {
+      warning(paste("Missing file for", pair_name, "in condition", z))
+      next
+    }
+    
+    tempcor1 <- read_tsv(path1, show_col_types = FALSE) %>% 
+      mutate(id = paste0(WT_AA, position, mutation)) %>% 
+      filter(!grepl("SM", id)) %>% 
+      dplyr::select(id, effect) %>% 
+      dplyr::rename(!!paste0("effect_", rep1) := effect)
+    
+    tempcor2 <- read_tsv(path2, show_col_types = FALSE) %>% 
+      mutate(id = paste0(WT_AA, position, mutation)) %>% 
+      filter(!grepl("SM", id)) %>% 
+      dplyr::select(id, effect) %>% 
+      dplyr::rename(!!paste0("effect_", rep2) := effect)
+    
+    tempp <- inner_join(tempcor1, tempcor2, by = "id")
+    repscorecor_list[[z]][[pair_name]] <- tempp
+    
+    cor_result <- cor.test(tempp[[paste0("effect_", rep1)]], 
+                           tempp[[paste0("effect_", rep2)]], 
+                           method = "pearson")
+    cor_result_list[[z]][[pair_name]] <- cor_result
+    
+    print(paste("Condition:", z, "- Pair:", pair_name, "- Rows:", nrow(tempp), 
+                "- Cor:", round(cor_result$estimate, 4), 
+                "- P-value:", format(cor_result$p.value, scientific = TRUE)))
+    
+    p <- ggplot(tempp, aes(x = .data[[paste0("effect_", rep1)]], 
+                           y = .data[[paste0("effect_", rep2)]])) +
+      geom_point(color = "steelblue", alpha = 0.6) +
+      geom_smooth(method = "lm", se = FALSE, color = "red") +
+      theme_minimal() +
+      stat_cor(method = "pearson", p.digits = 3, r.digits = 3) +
+      labs(
+        x = rep1,
+        y = rep2,
+        title = paste0(rep1, " vs ", rep2, " (", z, ")")
+      )
+    print(p)
+    
+    plot_dir <- "/stor/work/Jara/threedim_bins/lilace/finalplots"
+    if (!dir.exists(plot_dir)) dir.create(plot_dir, recursive = TRUE)
+    ggsave(file.path(plot_dir, paste0("indrep_corr_", pair_name, "_", z, ".pdf")), 
+           plot=p, width = 8, height = 6)
+  }
+}
+
+# Save correlation data
+for (z in names(repscorecor_list)) {
+  for (pair_name in names(repscorecor_list[[z]])) {
+    write_csv(
+      repscorecor_list[[z]][[pair_name]],
+      paste0("/stor/work/Jara/threedim_bins/lilace/finalout/indrep/repscorecor_", pair_name, "_", z, ".csv")
+    )
+  }
+}
+
+# Correlation summary
+cor_summary <- bind_rows(
+  lapply(names(cor_result_list), function(z) {
+    bind_rows(
+      lapply(names(cor_result_list[[z]]), function(pair_name) {
+        x <- cor_result_list[[z]][[pair_name]]
+        tibble(
+          condition = z,
+          comparison = pair_name,
+          correlation = x$estimate,
+          p_value = x$p.value,
+          method = x$method
+        )
+      })
+    )
+  })
+)
+
+write_csv(cor_summary, "/stor/work/Jara/threedim_bins/lilace/finalout/indrep/cor_results.csv")
+print(cor_summary)
+```
