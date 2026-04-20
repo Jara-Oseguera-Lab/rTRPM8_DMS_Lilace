@@ -1,4 +1,4 @@
-# rTRPM8_DMS_Lilace
+# Deep mutational scan of the pore of the cold-sensing TRPM8 channel. 
 Data Manipulation of Variant Calling Data for Lilace Processing
 
 Publication: [link]
