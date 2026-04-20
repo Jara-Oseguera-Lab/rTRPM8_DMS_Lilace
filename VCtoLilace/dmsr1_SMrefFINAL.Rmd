@@ -1,0 +1,111 @@
+---
+title: "dmsr1_SMrefFINAL"
+output: html_document
+date: "2025-09-04"
+---
+
+# libraries
+```{r}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(BiocManager)
+library(plotly)
+library(tibble)
+library(dbscan)
+library(pheatmap)
+library(ComplexHeatmap)
+library(ggpubr)
+library(stringr)
+library(cmdstanr)
+library(lilace)
+```
+
+# import data
+```{r}
+NEWdmsr3_raw_all <- read.csv("/stor/work/Jara/threedim_bins/DMS_data/dmsr4/dmsr34_raw_all.csv") %>% 
+  filter(grepl("R3", sample)) %>% 
+  rename("AminoAcid" = "alt_res") %>% 
+  mutate(Condition = case_when(substr(sample, 4, 4) == "C" ~ "Cold",
+                               substr(sample, 4, 4) == "M" ~ "Menthol",
+                               substr(sample, 4, 4) == "R" ~ "RT"),
+         Bin = case_when(grepl("L", substr(sample, 5, 6)) ~ "Low",
+                         grepl("M", substr(sample, 5, 6)) ~ "Med",
+                         grepl("H", substr(sample, 5, 6)) ~ "High"))
+WTAA_pos <- c("S927", "H928", "C929", "T930", "F931", "S932", "G933", "N934", "E935", "S936", "K937", "P938", "L939", "C940", "V941", "E942", "L943", "D944", "E945", "Y946", "N947", "L948", "P949", "R950", "F951", "P952", "E953", "W954", "I955", "T956", "I957", "P958", "L959", "V960", "C961", "I962", "Y963", "M964", "L965", "S966", "T967", "N968", "I969", "L970", "L971", "V972", "N973", "L974" )
+colnames(NEWdmsr3_raw_all)[3:50] <- WTAA_pos
+
+menthol_high_dmsr3 <- read.csv("/stor/work/Jara/threedim_bins/DMS_data/rawreads_dmsr2/menthol_high_dmsr2.csv")
+menthol_med_dmsr3 <- read.csv("/stor/work/Jara/threedim_bins/DMS_data/rawreads_dmsr2/menthol_medium_dmsr2.csv")
+menthol_low_dmsr3 <- read.csv("/stor/work/Jara/threedim_bins/DMS_data/rawreads_dmsr2/menthol_low_dmsr2.csv")
+
+cold_high_dmsr3 <- read.csv("/stor/work/Jara/threedim_bins/DMS_data/rawreads_dmsr2/cold_high_dmsr2.csv")
+cold_med_dmsr3 <- read.csv("/stor/work/Jara/threedim_bins/DMS_data/rawreads_dmsr2/cold_medium_dmsr2.csv")
+cold_low_dmsr3 <- read.csv("/stor/work/Jara/threedim_bins/DMS_data/rawreads_dmsr2/cold_low_dmsr2.csv")
+
+rt_high_dmsr3 <- read.csv("/stor/work/Jara/threedim_bins/DMS_data/rawreads_dmsr2/rt_high_dmsr2.csv")
+rt_med_dmsr3<- read.csv("/stor/work/Jara/threedim_bins/DMS_data/rawreads_dmsr2/rt_medium_dmsr2.csv")
+rt_low_dmsr3 <- read.csv("/stor/work/Jara/threedim_bins/DMS_data/rawreads_dmsr2/rt_low_dmsr2.csv")
+
+NEWdmsr3_sm_rt_raw <- data.frame(silent_mutation = c("SM1", "SM2", "SM3", "SM4"),
+                             low = c(9596, 10157, 10559, 5446),
+                             med = c(27166, 28925, 33138, 16719),
+                             high = c(102627, 175724, 168185, 86810))
+
+NEWdmsr3_sm_menthol_raw <- data.frame(silent_mutation = c("SM1", "SM2", "SM3", "SM4"),
+                             low = c(2073, 2537, 2220, 1143),
+                             med = c(2778, 2950, 2693, 738),
+                             high = c(84437, 92473, 101508, 60288))
+
+NEWdmsr3_sm_cold_raw <- data.frame(silent_mutation = c("SM1", "SM2", "SM3", "SM4"),
+                             low = c(3910, 3819, 4915, 2335),
+                             med = c(10954, 10675, 15175, 7241),
+                             high = c(93800, 81271, 116601, 70892))
+
+condition <- c("rt", "menthol", "cold")
+for (i in condition) {
+  write.csv(get(paste0("NEWdmsr3_sm_",i,"_raw")), paste0("/stor/work/Jara/threedim_bins/lilace/sm_reads/NEWdsmr3_sm_",i,"_raw.csv"))
+}
+
+binproportions <- data.frame(condition = c("rt", "menthol", "cold"),
+                             low = c(0.393340270551509, 0.357142857142857, 0.151356993736952),
+                             med = c(0.467221644120708, 0.397058823529412, 0.480167015),
+                             high = c(0.139438085327784, 0.245798319327731, 0.368475991649269)) %>% 
+  column_to_rownames(var="condition")
+```
+
+# lilace export
+```{r}
+condition_list <- c("RT", "Menthol", "Cold")
+bin_list <- c("Low", "Med", "High")
+
+# new
+lt <- NEWdmsr3_raw_all %>% 
+  select(AminoAcid, sample, Condition, Bin, everything()) %>% 
+  pivot_longer(cols=5:52, names_to = "Position", values_to = "RawReads") %>% 
+  select(-sample) %>% 
+  pivot_wider(names_from = Bin, values_from = RawReads) %>% 
+  rename(Variant = Position, Mutation_AA = AminoAcid) %>% 
+  mutate(WT_AA = str_sub(Variant, 1, 1),
+         Variant = paste0(Variant, Mutation_AA),
+         Position = str_sub(Variant, 2, 4),
+         Replicate = "NEWRep3") %>% 
+  select(Variant, WT_AA, Mutation_AA, Position, Condition, Low, Med, High, Replicate)
+
+write.csv(lt, "/stor/work/Jara/data/2025/lilace_inputs/NEWRep3.csv")
+
+# sm
+lt_newsm_individual <- list()
+for (i in condition_list) {
+  temp <- get(paste0("NEWdmsr3_sm_",tolower(i),"_raw")) %>% 
+    rename(Low = low, Med = med, High = high, Variant = silent_mutation) %>% 
+    mutate(Condition = i, Position = 0, Mutation_AA = "SM", WT_AA = "SM", Replicate = paste0("NEWRep3_",i), Mutation_Type = "synonymous") %>% 
+    select(Variant, WT_AA, Mutation_AA, Position, Condition, 2:4, Replicate, Mutation_Type)
+  lt_newsm_individual[[i]] <- temp
+}
+
+list_smrep3 <- c(lt_newsm_individual)
+list_smrep3 <- bind_rows(list_smrep3)
+
+write.csv(list_smrep3, "/stor/work/Jara/data/2025/lilace_inputs/sm_Rep3.csv")
+```

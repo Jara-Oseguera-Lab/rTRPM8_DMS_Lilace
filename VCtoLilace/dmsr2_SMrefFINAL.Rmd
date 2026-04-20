@@ -1,0 +1,92 @@
+---
+title: "dmsr2_SMrefFINAL"
+output: html_document
+date: "2025-09-04"
+---
+
+# libraries
+```{r}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(BiocManager)
+library(plotly)
+library(tibble)
+library(dbscan)
+library(pheatmap)
+library(ComplexHeatmap)
+library(ggpubr)
+library(stringr)
+library(cmdstanr)
+library(lilace)
+```
+
+# import data
+```{r}
+dmsr4_raw_all <- read.csv("/stor/work/Jara/threedim_bins/DMS_data/dmsr4/dmsr34_raw_all.csv") %>% 
+  filter(grepl("R4", sample)) %>% 
+  rename("AminoAcid" = "alt_res") %>% 
+  mutate(Condition = case_when(substr(sample, 4, 4) == "C" ~ "Cold",
+                               substr(sample, 4, 4) == "M" ~ "Menthol",
+                               substr(sample, 4, 4) == "R" ~ "RT"),
+         Bin = case_when(grepl("L", substr(sample, 5, 6)) ~ "Low",
+                         grepl("M", substr(sample, 5, 6)) ~ "Med",
+                         grepl("H", substr(sample, 5, 6)) ~ "High"))
+WTAA_pos <- c("S927", "H928", "C929", "T930", "F931", "S932", "G933", "N934", "E935", "S936", "K937", "P938", "L939", "C940", "V941", "E942", "L943", "D944", "E945", "Y946", "N947", "L948", "P949", "R950", "F951", "P952", "E953", "W954", "I955", "T956", "I957", "P958", "L959", "V960", "C961", "I962", "Y963", "M964", "L965", "S966", "T967", "N968", "I969", "L970", "L971", "V972", "N973", "L974" )
+colnames(dmsr4_raw_all)[3:50] <- WTAA_pos
+
+dmsr4_sm_rt_raw <- data.frame(silent_mutation = c("SM1", "SM2", "SM3", "SM4"),
+                             low = c(14234, 13548, 13703, 5770),
+                             med = c(21537, 16219, 17619, 9169),
+                             high = c(46544, 26398, 34802, 9612))
+
+dmsr4_sm_menthol_raw <- data.frame(silent_mutation = c("SM1", "SM2", "SM3", "SM4"),
+                             low = c(3832, 2636, 2596, 2559),
+                             med = c(2969, 2863, 2540, 2919),
+                             high = c(55467, 49079, 50034, 23390))
+
+dmsr4_sm_cold_raw <- data.frame(silent_mutation = c("SM1", "SM2", "SM3", "SM4"),
+                             low = c(2657, 2724, 3375, 2318),
+                             med = c(2936, 3591, 3954, 3165),
+                             high = c(36184, 39925, 33657, 22443))
+binproportions <- data.frame(condition = c("rt", "menthol", "cold"),
+                             low = c(0.453815261044177, 0.185370741482966, 0.0855997721122176),
+                             med = c(0.530120481927711, 0.562124248496994, 0.57515031789029),
+                             high = c(0.0160642570281125, 0.25250501002004, 0.339249909997492)) %>% 
+  column_to_rownames(var="condition")
+```
+
+# lilace export
+```{r}
+# norm
+condition_list <- c("rt", "menthol", "cold")
+bin_list <- c("low", "med", "high")
+lt <- dmsr4_raw_all %>% 
+  select(AminoAcid, sample, Condition, Bin, everything()) %>% 
+  pivot_longer(cols=5:52, names_to = "Position", values_to = "RawReads") %>% 
+  select(-sample) %>% 
+  pivot_wider(names_from = Bin, values_from = RawReads) %>% 
+  rename(Variant = Position, Mutation_AA = AminoAcid) %>% 
+  mutate(WT_AA = str_sub(Variant, 1, 1),
+         Variant = paste0(Variant, Mutation_AA),
+         Position = str_sub(Variant, 2, 4),
+         Replicate = "Rep4") %>% 
+  select(Variant, WT_AA, Mutation_AA, Position, Condition, Low, Med, High, Replicate)
+
+write.csv(lt, "/stor/work/Jara/data/2025/lilace_inputs/Rep4.csv")
+
+# sm
+condition_list <- c("RT", "Menthol", "Cold")
+lt_newsm_individual <- list()
+for (i in condition_list) {
+  temp <- get(paste0("dmsr4_sm_",tolower(i),"_raw")) %>% 
+    rename(Low = low, Med = med, High = high, Variant = silent_mutation) %>% 
+    mutate(Condition = i, Position = 0, Mutation_AA = "SM", WT_AA = "SM", Replicate = paste0("Rep4_",i), Mutation_Type = "synonymous") %>% 
+    select(Variant, WT_AA, Mutation_AA, Position, Condition, 2:4, Replicate, Mutation_Type)
+  lt_newsm_individual[[i]] <- temp
+}
+
+list_smrep4 <- bind_rows(lt_newsm_individual)
+
+write.csv(list_smrep4, "/stor/work/Jara/data/2025/lilace_inputs/sm_Rep4.csv")
+```
