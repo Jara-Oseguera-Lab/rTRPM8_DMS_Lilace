@@ -26,16 +26,16 @@ _structural_analysis_C1-O-D.Rmd_, _structural_analysis_julius.Rmd_, _structural_
 
 Calculation of van der Waals (VDW) contacts per analyzed structure using a contact function based on ChimeraX's native "contact" function; visualization of contacts via contact maps and heat maps
 
-Each script is for each set of structures analyzed:
+Each script is for each set of PDB structures analyzed:
 
-_C1-O-D_:
-
-
-_julius_:
+_C1-O-D_: 8E4L, 8E4N, 9B6D
 
 
-_trpm2_:
+_julius_: 9P8Y, 9PB5, 9PAR, 9ZCQ
 
 
-_trpm4_:
+_trpm2_: 6DRJ, 6DRK
+
+
+_trpm4_: 9MRT, 9MTA, 9B8Y, 6BQR
 
